@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Payroll Reconciliation</title>
+  <!-- SheetJS: read & write Excel files in the browser -->
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <!-- fuzzball.js: JS port of Python's thefuzz library -->
+  <script src="https://cdn.jsdelivr.net/npm/fuzzball@2.1.0/dist/fuzzball.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f0f4f8;
+      color: #2d3748;
+      min-height: 100vh;
+    }
+
+    header {
+      background: linear-gradient(135deg, #1a365d 0%, #2b6cb0 100%);
+      color: #fff;
+      padding: 2rem 1rem;
+      text-align: center;
+    }
+    header h1 { font-size: 1.8rem; font-weight: 700; letter-spacing: -0.02em; }
+    header p  { margin-top: 0.4rem; opacity: 0.82; font-size: 0.95rem; }
+
+    main { max-width: 780px; margin: 2rem auto; padding: 0 1rem 4rem; }
+
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      padding: 1.75rem;
+      margin-bottom: 1.25rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 16px rgba(0,0,0,0.06);
+    }
+    .card h2 {
+      font-size: 1rem;
+      font-weight: 700;
+      color: #1a365d;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 1.2rem;
+    }
+
+    #drop-zone {
+      border: 2px dashed #bee3f8;
+      border-radius: 8px;
+      padding: 2.5rem 1.5rem;
+      text-align: center;
+      cursor: pointer;
+      background: #ebf8ff;
+      transition: border-color 0.2s, background 0.2s;
+      user-select: none;
+    }
+    #drop-zone.drag-over { border-color: #2b6cb0; background: #dbeafe; }
+    #drop-zone .dz-icon { font-size: 2.4rem; margin-bottom: 0.6rem; }
+    #drop-zone p { color: #4a5568; font-size: 0.95rem; }
+    #drop-zone .browse-link { color: #2b6cb0; font-weight: 600; text-decoration: underline; cursor: pointer; }
+    #drop-zone .dz-hint { font-size: 0.8rem; color: #a0aec0; margin-top: 0.4rem; }
+    #file-input { display: none; }
+
+    #file-list { margin-top: 0.9rem; }
+    .file-item {
+      display: flex; align-items: center; gap: 0.6rem;
+      padding: 0.55rem 0.75rem;
+      background: #f7fafc;
+      border-radius: 6px;
+      margin-bottom: 0.4rem;
+      font-size: 0.88rem;
+    }
+    .file-item .fi-name { flex: 1; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-item .fi-size { color: #718096; white-space: nowrap; }
+    .file-item .fi-remove { background: none; border: none; cursor: pointer; color: #e53e3e; font-size: 1.1rem; line-height: 1; padding: 0 0.2rem; }
+
+    .thresh-row { display: flex; align-items: center; gap: 1rem; }
+    .thresh-row label { font-weight: 600; white-space: nowrap; min-width: 80px; }
+    #threshold-slider { flex: 1; accent-color: #2b6cb0; cursor: pointer; }
+    #threshold-display {
+      background: #ebf8ff; border: 1.5px solid #bee3f8;
+      color: #1a365d; font-weight: 700; font-size: 1rem;
+      padding: 0.3rem 0.8rem; border-radius: 6px;
+      min-width: 4.2rem; text-align: center;
+    }
+    .thresh-hint { margin-top: 0.8rem; font-size: 0.82rem; color: #718096; line-height: 1.5; }
+
+    #process-btn {
+      width: 100%; padding: 0.95rem;
+      background: linear-gradient(135deg, #1a365d 0%, #2b6cb0 100%);
+      color: #fff; border: none; border-radius: 8px;
+      font-size: 1rem; font-weight: 700; cursor: pointer;
+      letter-spacing: 0.02em; transition: opacity 0.2s, transform 0.1s;
+    }
+    #process-btn:hover:not(:disabled) { opacity: 0.9; }
+    #process-btn:active:not(:disabled) { transform: scale(0.99); }
+    #process-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+    #results-card { display: none; }
+
+    .results-table {
+      width: 100%; border-collapse: collapse;
+      font-size: 0.87rem; margin-bottom: 1.25rem;
+      border-radius: 8px; overflow: hidden;
+    }
+    .results-table thead th {
+      background: #1a365d; color: #fff;
+      padding: 0.65rem 0.85rem; text-align: left; font-weight: 600;
+    }
+    .results-table thead th.num-col { text-align: center; }
+    .results-table tbody td { padding: 0.6rem 0.85rem; border-bottom: 1px solid #e2e8f0; }
+    .results-table tbody tr:last-child td { border-bottom: none; }
+    .results-table tbody tr:nth-child(even) td { background: #f7fafc; }
+    .num-cell { text-align: center; font-weight: 700; }
+    .c-exact   { color: #276749; }
+    .c-close   { color: #744210; }
+    .c-missing { color: #9b2c2c; }
+
+    #download-btn {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      padding: 0.75rem 1.5rem; background: #276749; color: #fff;
+      border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 700;
+      cursor: pointer; transition: opacity 0.2s;
+    }
+    #download-btn:hover { opacity: 0.88; }
+
+    .error-item {
+      background: #fff5f5; border: 1px solid #fed7d7;
+      border-radius: 6px; padding: 0.6rem 1rem;
+      margin-top: 0.45rem; font-size: 0.87rem; color: #742a2a;
+    }
+
+    .spinner {
+      display: inline-block; width: 1rem; height: 1rem;
+      border: 2px solid rgba(255,255,255,0.35); border-top-color: #fff;
+      border-radius: 50%; animation: spin 0.75s linear infinite;
+      vertical-align: middle; margin-right: 0.4rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Payroll Reconciliation</h1>
+  <p>Upload one or more payroll Excel files — everything runs in your browser</p>
+</header>
+
+<main>
+
+  <div class="card">
+    <h2>Upload Files</h2>
+    <div id="drop-zone">
+      <div class="dz-icon">📊</div>
+      <p>Drag &amp; drop Excel files here, or
+        <span class="browse-link" onclick="document.getElementById('file-input').click()">browse</span>
+      </p>
+      <p class="dz-hint">.xlsx and .xls &bull; multiple files supported</p>
+    </div>
+    <input type="file" id="file-input" accept=".xlsx,.xls" multiple>
+    <div id="file-list"></div>
+  </div>
+
+  <div class="card">
+    <h2>Match Threshold</h2>
+    <div class="thresh-row">
+      <label for="threshold-slider">Threshold</label>
+      <input type="range" id="threshold-slider" min="0.50" max="1.00" step="0.01" value="0.73">
+      <div id="threshold-display">0.73</div>
+    </div>
+    <p class="thresh-hint">
+      Controls fuzzy name matching sensitivity &mdash;
+      <strong>higher</strong> = stricter &bull; <strong>lower</strong> = more lenient &bull; Default: <strong>0.73</strong>
+    </p>
+  </div>
+
+  <button id="process-btn" onclick="processFiles()">Run Reconciliation</button>
+
+  <div class="card" id="results-card">
+    <h2>Results</h2>
+    <div id="results-content"></div>
+  </div>
+
+</main>
+
+<script>
+  const DEFAULT_THRESHOLD = 0.73;
+
+  const fileInput = document.getElementById("file-input");
+  const dropZone  = document.getElementById("drop-zone");
+  const fileList  = document.getElementById("file-list");
+  const slider    = document.getElementById("threshold-slider");
+  const display   = document.getElementById("threshold-display");
+
+  let selectedFiles = [];
+
+  slider.addEventListener("input", () => {
+    display.textContent = parseFloat(slider.value).toFixed(2);
+  });
+
+  fileInput.addEventListener("change", () => { addFiles(fileInput.files); fileInput.value = ""; });
+  dropZone.addEventListener("dragover",  e => { e.preventDefault(); dropZone.classList.add("drag-over"); });
+  dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+  dropZone.addEventListener("drop", e => {
+    e.preventDefault(); dropZone.classList.remove("drag-over"); addFiles(e.dataTransfer.files);
+  });
+
+  function addFiles(files) {
+    for (const f of files) {
+      if (!selectedFiles.find(sf => sf.name === f.name)) selectedFiles.push(f);
+    }
+    renderFileList();
+  }
+
+  function removeFile(name) {
+    selectedFiles = selectedFiles.filter(f => f.name !== name);
+    renderFileList();
+  }
+
+  function renderFileList() {
+    fileList.innerHTML = "";
+    selectedFiles.forEach(f => {
+      const size = f.size < 1024 * 1024
+        ? `${(f.size / 1024).toFixed(1)} KB`
+        : `${(f.size / 1024 / 1024).toFixed(1)} MB`;
+      const el = document.createElement("div");
+      el.className = "file-item";
+      el.innerHTML = `
+        <span class="fi-name">📄 ${esc(f.name)}</span>
+        <span class="fi-size">${size}</span>
+        <button class="fi-remove" onclick="removeFile('${f.name.replace(/'/g,"\\'")}')">✕</button>
+      `;
+      fileList.appendChild(el);
+    });
+  }
+
+  function esc(s) {
+    return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  }
+
+  /* ─── Core reconciliation logic (mirrors reconcile.py) ─── */
+
+  function cleanName(val) {
+    if (val === null || val === undefined) return null;
+    const s = String(val).trim().toUpperCase();
+    return (s === "" || s === "NAN" || s === "UNDEFINED" || s === "NULL") ? null : s;
+  }
+
+  function similarity(a, b) {
+    return Math.max(
+      fuzzball.ratio(a, b),
+      fuzzball.partial_ratio(a, b),
+      fuzzball.token_sort_ratio(a, b),
+      fuzzball.token_set_ratio(a, b)
+    ) / 100.0;
+  }
+
+  function reconcileRows(rows, threshold) {
+    // rows = array-of-arrays from SheetJS (header:1)
+    // With pandas header=0, Excel row 1 is consumed as column names.
+    // So df.iloc[2:] maps to rows.slice(3) here (skip row 0 = header, rows 1-2 = sub-headers).
+    const dataRows = rows.slice(3);
+
+    const approved = [];
+    const uploaded = [];
+
+    for (const row of dataRows) {
+      const aName = cleanName(row[1]);   // column B
+      if (aName) approved.push({ name: aName, amount: row[2] ?? "" });
+
+      const uName = cleanName(row[5]);   // column F
+      if (uName) uploaded.push({ name: uName, amount: row[6] ?? "" });
+    }
+
+    const exactMatches        = [];
+    const closeMatches        = [];
+    const approvedNotUploaded = [];
+    const uploadedRemaining   = [...uploaded];
+    const approvedUnmatched   = [];
+
+    // Pass 1: exact matches
+    for (const a of approved) {
+      const idx = uploadedRemaining.findIndex(u => u.name === a.name);
+      if (idx !== -1) {
+        const u = uploadedRemaining.splice(idx, 1)[0];
+        exactMatches.push([a.name, a.amount, u.name, u.amount]);
+      } else {
+        approvedUnmatched.push(a);
+      }
+    }
+
+    // Pass 2: fuzzy matches on remainder
+    for (const a of approvedUnmatched) {
+      let bestScore = 0, bestIdx = -1;
+      for (let i = 0; i < uploadedRemaining.length; i++) {
+        const score = similarity(a.name, uploadedRemaining[i].name);
+        if (score > bestScore) { bestScore = score; bestIdx = i; }
+      }
+      if (bestScore >= threshold) {
+        const u = uploadedRemaining.splice(bestIdx, 1)[0];
+        closeMatches.push([a.name, a.amount, u.name, u.amount, `Similarity ${Math.round(bestScore * 100)}%`]);
+      } else {
+        approvedNotUploaded.push([a.name, a.amount]);
+      }
+    }
+
+    return {
+      exactMatches,
+      closeMatches,
+      approvedNotUploaded,
+      uploadedNotApproved: uploadedRemaining.map(u => [u.name, u.amount]),
+    };
+  }
+
+  /* ─── Excel output helpers ─── */
+
+  function autoWidth(ws, data) {
+    const cols = [];
+    data.forEach(row => {
+      row.forEach((cell, i) => {
+        const len = cell ? String(cell).length : 0;
+        if (!cols[i] || cols[i].wch < len) cols[i] = { wch: Math.min(len + 2, 50) };
+      });
+    });
+    ws["!cols"] = cols;
+  }
+
+  function addSheet(wb, name, headers, rows) {
+    const data = [headers, ...rows];
+    const ws = XLSX.utils.aoa_to_sheet(data);
+    autoWidth(ws, data);
+    XLSX.utils.book_append_sheet(wb, ws, name);
+  }
+
+  /* ─── Main handler ─── */
+
+  async function processFiles() {
+    if (selectedFiles.length === 0) { alert("Please select at least one Excel file."); return; }
+
+    const btn = document.getElementById("process-btn");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Processing…';
+
+    const threshold = parseFloat(slider.value);
+    const wb = XLSX.utils.book_new();
+    const summaryRows = [];
+    const uiResults   = [];
+    const errors      = [];
+
+    for (const file of selectedFiles) {
+      try {
+        const buf  = await file.arrayBuffer();
+        const xl   = XLSX.read(buf, { type: "array" });
+        const sheetName = xl.SheetNames[0];
+        const rows = XLSX.utils.sheet_to_json(xl.Sheets[sheetName], { header: 1, defval: null });
+
+        const result = reconcileRows(rows, threshold);
+        const base   = file.name.replace(/\.[^.]+$/, "");
+        const pfx    = base.slice(0, 14);
+
+        addSheet(wb, `${pfx} Exact`,
+          ["Approved Name", "Approved Amount", "Uploaded Name", "Uploaded Amount"],
+          result.exactMatches);
+        addSheet(wb, `${pfx} Close`,
+          ["Approved Name", "Approved Amount", "Uploaded Name", "Uploaded Amount", "Reason"],
+          result.closeMatches);
+        addSheet(wb, `${pfx} Appr-Only`,
+          ["Approved Name", "Approved Amount"],
+          result.approvedNotUploaded);
+        addSheet(wb, `${pfx} Upld-Only`,
+          ["Uploaded Name", "Uploaded Amount"],
+          result.uploadedNotApproved);
+
+        summaryRows.push([
+          file.name, sheetName,
+          result.exactMatches.length,
+          result.closeMatches.length,
+          result.approvedNotUploaded.length,
+          result.uploadedNotApproved.length,
+        ]);
+
+        uiResults.push({
+          filename: file.name, sheet: sheetName,
+          exact:                 result.exactMatches.length,
+          close:                 result.closeMatches.length,
+          approved_not_uploaded: result.approvedNotUploaded.length,
+          uploaded_not_approved: result.uploadedNotApproved.length,
+        });
+      } catch (e) {
+        errors.push({ file: file.name, error: e.message });
+      }
+    }
+
+    if (uiResults.length === 0) {
+      showError("No files could be processed.");
+      btn.disabled = false;
+      btn.innerHTML = "Run Reconciliation";
+      return;
+    }
+
+    // Prepend Summary sheet
+    addSheet(wb, "Summary",
+      ["File", "Sheet", "Exact Matches", "Close Matches", "Approved Not Uploaded", "Uploaded Not Approved"],
+      summaryRows);
+    // Move Summary to front
+    wb.SheetNames.splice(wb.SheetNames.indexOf("Summary"), 1);
+    wb.SheetNames.unshift("Summary");
+
+    showResults(uiResults, errors, wb);
+
+    btn.disabled = false;
+    btn.innerHTML = "Run Reconciliation";
+  }
+
+  function showResults(results, errors, wb) {
+    const card    = document.getElementById("results-card");
+    const content = document.getElementById("results-content");
+    card.style.display = "block";
+
+    let html = `
+      <table class="results-table">
+        <thead><tr>
+          <th>File</th>
+          <th class="num-col">Exact</th>
+          <th class="num-col">Close</th>
+          <th class="num-col">Appr. Only</th>
+          <th class="num-col">Upld. Only</th>
+        </tr></thead><tbody>
+    `;
+
+    results.forEach(r => {
+      html += `<tr>
+        <td>${esc(r.filename)}<br><span style="font-size:0.78rem;color:#718096">sheet: ${esc(r.sheet)}</span></td>
+        <td class="num-cell c-exact">${r.exact}</td>
+        <td class="num-cell c-close">${r.close}</td>
+        <td class="num-cell c-missing">${r.approved_not_uploaded}</td>
+        <td class="num-cell c-missing">${r.uploaded_not_approved}</td>
+      </tr>`;
+    });
+    html += "</tbody></table>";
+
+    if (errors.length) {
+      html += `<p style="color:#742a2a;font-weight:700;margin-bottom:0.25rem">Errors (${errors.length})</p>`;
+      errors.forEach(e => {
+        html += `<div class="error-item"><strong>${esc(e.file)}</strong>: ${esc(e.error)}</div>`;
+      });
+      html += "<br>";
+    }
+
+    html += `<button id="download-btn" onclick="downloadReport()">⬇&nbsp; Download Report (.xlsx)</button>`;
+    content.innerHTML = html;
+
+    // Store wb for download
+    window._pendingWb = wb;
+
+    card.scrollIntoView({ behavior: "smooth" });
+  }
+
+  function downloadReport() {
+    if (window._pendingWb) {
+      XLSX.writeFile(window._pendingWb, "Reconciliation_Results.xlsx");
+    }
+  }
+
+  function showError(msg) {
+    const card = document.getElementById("results-card");
+    card.style.display = "block";
+    document.getElementById("results-content").innerHTML =
+      `<div class="error-item" style="font-size:0.95rem"><strong>Error:</strong> ${esc(msg)}</div>`;
+    card.scrollIntoView({ behavior: "smooth" });
+  }
+</script>
+
+</body>
+</html>
