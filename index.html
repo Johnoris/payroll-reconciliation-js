@@ -116,6 +116,7 @@
     .c-exact   { color: #276749; }
     .c-close   { color: #744210; }
     .c-missing { color: #9b2c2c; }
+    .c-ghost   { color: #7b341e; }
 
     #download-btn {
       display: inline-flex; align-items: center; gap: 0.5rem;
@@ -171,7 +172,10 @@
     </div>
     <p class="thresh-hint">
       Controls fuzzy name matching sensitivity &mdash;
-      <strong>higher</strong> = stricter &bull; <strong>lower</strong> = more lenient &bull; Default: <strong>0.73</strong>
+      <strong>higher</strong> = stricter &bull; <strong>lower</strong> = more lenient &bull; Default: <strong>0.73</strong><br>
+      Scores are weighted by token overlap to reduce false positives from shared surnames.
+      OCR artifacts in bank names (e.g. &ldquo;MOSHOO D&rdquo; &rarr; &ldquo;MOSHOOD&rdquo;) are corrected automatically.
+      Pairs below threshold but with matching salary &amp; &ge;55% name similarity are promoted to Close Matches.
     </p>
   </div>
 
@@ -241,19 +245,64 @@
 
   /* ─── Core reconciliation logic (mirrors reconcile.py) ─── */
 
+  const HONORIFICS_RE = /^(ALHAJI|ALHAJA|CHIEF|PASTOR|REV\.?|DR\.?|MR\.?|MRS\.?|MISS|ENGR\.?|BARR\.?|HON\.?|COMRADE|DEACONESS|DEACON)\s+/;
+
   function cleanName(val) {
     if (val === null || val === undefined) return null;
-    const s = String(val).trim().toUpperCase();
-    return (s === "" || s === "NAN" || s === "UNDEFINED" || s === "NULL") ? null : s;
+    let s = String(val).trim().toUpperCase();
+    if (s === "" || s === "NAN" || s === "UNDEFINED" || s === "NULL") return null;
+    s = s.replace(HONORIFICS_RE, "").trim();
+    return s || null;
+  }
+
+  // Merge single-character tokens with the preceding token.
+  // Bank-uploaded names often have OCR artifacts: "MOSHOO D" → "MOSHOOD",
+  // "MARGRE T BLESSIN G" → "MARGRET BLESSING", "NDIFREK E" → "NDIFREKE".
+  function fixOCRFragments(name) {
+    const tokens = name.split(/\s+/);
+    const result = [];
+    for (const tok of tokens) {
+      if (tok.length === 1 && result.length > 0) {
+        result[result.length - 1] += tok;
+      } else {
+        result.push(tok);
+      }
+    }
+    return result.join(" ");
+  }
+
+  // Fraction of the shorter name's meaningful tokens (≥3 chars) that appear in both names.
+  // Used to weight down coincidental token_set_ratio=100 matches caused by a shared surname.
+  function tokenOverlap(a, b) {
+    const ta = a.split(/\s+/).filter(t => t.length >= 3);
+    const tb = new Set(b.split(/\s+/).filter(t => t.length >= 3));
+    if (ta.length === 0 || tb.size === 0) return 0;
+    const shared = ta.filter(t => tb.has(t)).length;
+    return shared / Math.min(ta.length, tb.size);
   }
 
   function similarity(a, b) {
-    return Math.max(
+    const rawScores = [
       fuzzball.ratio(a, b),
       fuzzball.partial_ratio(a, b),
       fuzzball.token_sort_ratio(a, b),
-      fuzzball.token_set_ratio(a, b)
-    ) / 100.0;
+      fuzzball.token_set_ratio(a, b),
+    ];
+    // Also score with OCR-corrected names (single-char tokens merged into previous)
+    const aFixed = fixOCRFragments(a);
+    const bFixed = fixOCRFragments(b);
+    if (aFixed !== a || bFixed !== b) {
+      rawScores.push(
+        fuzzball.token_sort_ratio(aFixed, bFixed),
+        fuzzball.token_set_ratio(aFixed, bFixed)
+      );
+    }
+    const bestFuzzy = Math.max(...rawScores) / 100.0;
+    // Penalise when shared token overlap is low — prevents a single shared surname
+    // from producing a 100% token_set_ratio match between different people.
+    // overlap=0 → score halved; overlap=1 → score unchanged.
+    const overlap = Math.max(tokenOverlap(a, b), tokenOverlap(aFixed, bFixed));
+    return bestFuzzy * (0.5 + 0.5 * overlap);
   }
 
   function reconcileRows(rows, threshold) {
@@ -299,17 +348,58 @@
       }
       if (bestScore >= threshold) {
         const u = uploadedRemaining.splice(bestIdx, 1)[0];
-        closeMatches.push([a.name, a.amount, u.name, u.amount, `Similarity ${Math.round(bestScore * 100)}%`]);
+        const aAmt = parseFloat(a.amount) || 0;
+        const uAmt = parseFloat(u.amount) || 0;
+        const diff  = Math.abs(aAmt - uAmt);
+        const amtNote = diff > 0.05 ? ` | ⚠ Amt diff: ₦${diff.toFixed(2)}` : "";
+        closeMatches.push([a.name, a.amount, u.name, u.amount,
+          `Similarity ${Math.round(bestScore * 100)}%${amtNote}`]);
       } else {
         approvedNotUploaded.push([a.name, a.amount]);
       }
     }
 
+    // Pass 3: amount-confirmed rescue — pairs where salaries match exactly (±₦0.05)
+    // AND raw name similarity is ≥ 55%. Catches legitimate name variants that the
+    // overlap-weighted Pass 2 was too conservative to promote on name alone
+    // (e.g. MURAINA QUADRI ADESINA ↔ QUADRI ADESHINA MURAINO — 93% raw, same salary).
+    // Low-similarity, same-amount pairs (suspected ghost workers) stay in the
+    // approved-only / uploaded-only lists for manual review.
+    const rescuedAppr = new Set();
+    const rescuedUpld = new Set();
+    const amtPairs    = [];
+
+    for (let ai = 0; ai < approvedNotUploaded.length; ai++) {
+      const [aName, aAmt] = approvedNotUploaded[ai];
+      const aRound = Math.round((parseFloat(aAmt) || 0) * 100) / 100;
+      if (aRound <= 0) continue;
+      for (let ui = 0; ui < uploadedRemaining.length; ui++) {
+        const u = uploadedRemaining[ui];
+        const uRound = Math.round((parseFloat(u.amount) || 0) * 100) / 100;
+        if (Math.abs(aRound - uRound) > 0.05) continue;
+        const rawSim = Math.max(
+          fuzzball.ratio(aName, u.name),
+          fuzzball.token_set_ratio(aName, u.name)
+        ) / 100;
+        if (rawSim >= 0.55) amtPairs.push({ ai, ui, aName, aAmt, uName: u.name, uAmt: u.amount, rawSim });
+      }
+    }
+
+    // Assign highest-scoring pairs first to avoid double-matching
+    amtPairs.sort((x, y) => y.rawSim - x.rawSim);
+    for (const { ai, ui, aName, aAmt, uName, uAmt, rawSim } of amtPairs) {
+      if (rescuedAppr.has(ai) || rescuedUpld.has(ui)) continue;
+      rescuedAppr.add(ai);
+      rescuedUpld.add(ui);
+      closeMatches.push([aName, aAmt, uName, uAmt,
+        `Similarity ${Math.round(rawSim * 100)}% | Amount confirmed`]);
+    }
+
     return {
       exactMatches,
       closeMatches,
-      approvedNotUploaded,
-      uploadedNotApproved: uploadedRemaining.map(u => [u.name, u.amount]),
+      approvedNotUploaded: approvedNotUploaded.filter((_, i) => !rescuedAppr.has(i)),
+      uploadedNotApproved: uploadedRemaining.filter((_, i) => !rescuedUpld.has(i)).map(u => [u.name, u.amount]),
     };
   }
 
@@ -371,7 +461,6 @@
         addSheet(wb, `${pfx} Upld-Only`,
           ["Uploaded Name", "Uploaded Amount"],
           result.uploadedNotApproved);
-
         summaryRows.push([
           file.name, sheetName,
           result.exactMatches.length,
